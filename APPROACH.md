@@ -1,75 +1,132 @@
 # Design Approach
 
-## Core Architecture Decision: Hybrid LLM + Deterministic
+## 1. System Prompt Architecture
 
-The fundamental choice is splitting work between the LLM and code:
+The system prompt is the most critical piece of this project — 80% of agent quality comes from prompt design.
 
-- **LLM handles reasoning**: "which element is the headline?", "what does 'move it up' mean?", "the user said 'make the badge red' — which nodes form the badge?"
-- **Code handles math**: coordinate transformations, normalized ↔ absolute conversions, aspect ratio reflows
+### Compact Node Summary (not raw JSON)
 
-This avoids the biggest failure mode of pure-LLM approaches: arithmetic errors in coordinate calculations. An LLM asked to compute `0.3503396592170152 × 1920` will sometimes hallucinate. A deterministic function won't.
+The initial approach embedded the entire layout JSON (~3,000 tokens) in the system prompt and asked the LLM to return the complete modified JSON. This failed for two reasons: the response exceeded token limits on budget-friendly models, and LLMs make arithmetic errors when manipulating coordinate values in large JSON structures.
 
-## System Prompt Design
+The final approach sends a **compact summary** of each node (id, name, type, normalized coordinates, and key properties like fontSize or fill color) — roughly 500 tokens instead of 3,000. The LLM only needs to identify which node to modify and what to change, not reproduce the entire document.
 
-The system prompt is the agent's brain. Key decisions:
+### Semantic Role Mapping
 
-1. **Semantic role mapping**: The prompt explicitly maps node names/content to semantic roles ("Background.png" → background, "Luxury Comfort" → headline). This bridges the gap between human language ("the headline") and JSON node IDs.
+The prompt explicitly maps node names and content to human-readable roles:
 
-2. **Composite element awareness**: The yellow circle and "20% OFF" text form a visual badge. The prompt tells the LLM to move them together.
-
-3. **Transformation rules as recipes**: Rather than hoping the LLM invents the right math, the prompt provides step-by-step transformation recipes (e.g., for aspect ratio conversion: change dimensions → recompute children → update fonts).
-
-4. **Strict output format**: The LLM returns JSON with `explanation` + `updatedLayout`. No markdown fences, no extra text. This makes parsing reliable.
-
-## Coordinate System
-
-The dual coordinate system (absolute + normalized) is the layout's most important feature:
-
-- **Normalized (0–1)** is the source of truth. A headline at `nx=0.12, ny=0.16` means "12% from left, 16% from top" regardless of canvas size.
-- **Absolute (pixels)** is derived: `x = nx × artboard_width`. It exists for compatibility with rendering engines that expect pixel values.
-
-When the artboard resizes (e.g., 1:1 → 9:16), we keep normalized values unchanged and recompute absolute values. This preserves relative positioning automatically.
-
-## Conversation Context
-
-The agent sends the last 6 messages (3 user + 3 assistant exchanges) to the LLM. This enables follow-ups:
-
-> User: "Make the headline smaller"
-> Assistant: "I reduced the headline font from 72px to 54px."
-> User: "Actually, make it even smaller"
-
-The LLM sees the prior exchange and knows "it" = "the headline". Without context, the second message is ambiguous.
-
-We limit to 6 messages to balance context quality against token cost. Older messages are less likely to be referenced and would dilute the prompt.
-
-## Wireframe Preview
-
-The preview uses CSS positioning with normalized coordinates directly as percentages. Each node becomes an absolutely-positioned div:
-
-```css
-left: ${nx * 100}%
-top: ${ny * 100}%
-width: ${nw * 100}%
-height: ${nh * 100}%
+```
+- text "Luxury Comfort" (72px) → headline (id: text_1778486306230_8)
+- shape Circle (#F4CF1B) + text "20% OFF" → discount badge (COMPOSITE: move both)
+- img "Product.png" → product image
 ```
 
-The container maintains aspect ratio using the CSS `aspect-ratio` property, fitting within the available space. Nodes are color-coded by type (blue=image, purple=text, yellow=shape) with labels showing content or name.
+This bridges the gap between a user saying "the headline" and the actual node ID `text_1778486306230_8`. Without this mapping, the LLM would have to infer roles from context — sometimes correctly, sometimes not.
 
-## Validation Strategy
+### Diff-Based Output Format
 
-Every LLM response goes through validation before being applied:
+Instead of returning the complete layout JSON, the LLM returns a minimal diff:
 
-1. Check response has `explanation` (string) and `updatedLayout` (object)
-2. Verify layout has `rootNodes` and `nodes`
-3. Verify artboard has `children` array
-4. Verify all children exist and have required coordinate fields
-5. Verify node types are valid
+```json
+{
+  "explanation": "Moved the headline to the top of the canvas",
+  "changes": [
+    { "nodeId": "text_1778486306230_8", "set": { "ny": 0.03 } }
+  ]
+}
+```
 
-If validation fails, the original layout is returned unchanged with an error message. The user never sees a broken state.
+The server then applies these changes deterministically to the full layout. This approach has three benefits:
+1. **Token efficiency** — responses are typically 50–200 tokens instead of 3,000+
+2. **Reliability** — the LLM only decides *what* to change, not *how* to compute coordinates
+3. **Validation** — it's trivial to verify that a diff has valid node IDs and reasonable values
 
-## Error Handling Philosophy
+---
 
-- **Never crash**: Every error is caught and produces a graceful fallback
-- **Preserve state**: On any failure, return the original layout unchanged
-- **Explain failures**: Tell the user what went wrong and suggest rephrasing
-- **Timeout protection**: 60-second timeout on LLM calls (they can be slow for large JSON)
+## 2. Safe JSON Transformation
+
+### The Trust Problem
+
+LLM output cannot be trusted as valid JSON. In testing across multiple models, common failure modes included:
+
+- **Math expressions instead of values**: Llama 3.1 would write `"nw": 0.78 * 0.7` instead of `"nw": 0.546` — valid arithmetic but invalid JSON
+- **Truncated output**: Models hitting token limits produce incomplete JSON
+- **Markdown wrapping**: Models wrap JSON in ` ```json ``` ` code fences despite instructions not to
+- **Extra commentary**: Some models add explanatory text before or after the JSON
+
+### Multi-Layer Recovery
+
+The parsing pipeline handles each failure mode in sequence:
+
+```
+Raw LLM text
+  → Strip markdown fences (```json ... ```)
+  → Evaluate inline math expressions (0.78 * 0.7 → 0.546)
+  → Resolve Math.round() calls
+  → JSON.parse()
+  → If parse fails: extract "explanation" via regex, return layout unchanged
+```
+
+The user never sees a broken state. If parsing fails entirely, they get a message like "I understood your request but could not generate a valid response" and the layout remains unchanged.
+
+### Deterministic Application
+
+The `applyDiff()` function in `routes/chat.js` applies changes to a deep clone of the layout:
+
+1. If `artboardResize` is present, update artboard dimensions and recompute ALL children's absolute coordinates from their normalized values. Font sizes are rescaled using `fontSizeRatio × newWidth`.
+2. For each entry in `changes`, apply the specified fields to the target node.
+3. After applying normalized coordinate changes, recompute absolute coordinates: `x = nx × artboardWidth`, etc.
+4. For color/fill/content changes, update the appropriate nested style fields.
+
+The server also has deterministic transform helpers (`resizeArtboard`, `moveNode`, `resizeNode`, `moveNodeGroup`) in `layoutTransforms.js` that can be called directly for operations that don't need LLM reasoning.
+
+---
+
+## 3. Conversation Context
+
+The agent maintains a sliding window of the last 6 messages (3 user + 3 assistant exchanges) and sends them with each request. This enables follow-up resolution:
+
+> **User**: "Make the headline smaller"
+> **Assistant**: "Reduced the headline font from 72px to 50px."
+> **User**: "Make it even smaller"
+
+The LLM sees the prior exchange and resolves "it" to "the headline." Without context, the second message is ambiguous.
+
+### Why 6 messages, not more?
+
+- **Token budget**: Each message consumes tokens from the already-constrained context window. On Groq's free tier with Llama 3.1 8B, the system prompt + 6 history messages + layout summary fits comfortably under limits. More history would risk truncation.
+- **Relevance decay**: Messages from 10+ turns ago rarely matter. The user isn't referring to something they said 15 minutes ago — they're reacting to the last change.
+- **Cost control**: On paid APIs (Anthropic, OpenRouter), more context = more money per request.
+
+---
+
+## 4. Trade-Offs and Future Improvements
+
+### Trade-Offs Made
+
+**Diff-based vs. full-layout responses**
+The diff approach trades flexibility for reliability. The LLM can't make creative multi-step changes in a single response (e.g., "reorganize everything for a story layout") because it can only express changes to known fields. A full-layout approach would allow more creative transformations but would require a larger, more expensive model to produce valid JSON consistently.
+
+**8B model vs. 70B model**
+Llama 3.1 8B is fast and free but occasionally misidentifies nodes or produces invalid diffs. The 70B model is significantly more accurate but consumes 4× more tokens, hitting Groq's daily free limit after ~40 requests. For a demo/portfolio project, reliability of access (free tier) was prioritized over reliability of reasoning.
+
+**Wireframe vs. rendered preview**
+The wireframe shows node positions, sizes, and labels but doesn't render actual images or typography. A rendered preview (using the Cloudinary image URLs and actual fonts) would be more visually compelling but adds significant complexity — CORS handling for cross-origin images, font loading, and z-index management for overlapping elements.
+
+**Client-side state vs. server-side state**
+All layout state lives in the React client (via `useState`). The server is stateless — each request includes the current layout. This simplifies deployment (no database, no sessions) but means refreshing the page resets everything.
+
+### What I'd Improve With More Time
+
+1. **Undo/redo stack** — Store layout snapshots on each change so users can step backwards. Currently, the only way to revert is the full reset button.
+
+2. **Rendered preview** — Load actual images from Cloudinary URLs and render text with proper fonts, sizes, and colors. The wireframe is functional but doesn't show the design as a user would see it.
+
+3. **Streaming responses** — Use server-sent events to stream the LLM explanation while it generates, then apply the diff when complete. Currently the user stares at a loading indicator for 1–4 seconds.
+
+4. **Model router** — Automatically select the model based on request complexity. Simple moves → 8B model (fast, cheap). Aspect ratio conversions → 70B model (better reasoning). This would optimize the cost/quality balance dynamically.
+
+5. **Batch operations** — Support multi-step commands like "Convert to 9:16 and move the headline to the top and make the badge bigger." Currently, each must be a separate message.
+
+6. **Persistent state** — Save layout versions to a database so users can share links to specific versions, or return to a session after closing the browser.
+
+7. **Visual diff indicator** — Highlight which nodes changed after each command (e.g., flash the modified element in the wireframe) so the user can immediately see what moved.
